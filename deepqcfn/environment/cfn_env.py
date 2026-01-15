@@ -5,6 +5,7 @@ import numpy as np
 from deepqcfn.models.task import TaskGenerator
 from deepqcfn.models.network import Network, Channel
 from deepqcfn.models.server import EdgeServer
+from deepqcfn.utils.algorithms import priority_sort
 
 class CFNEnv(gym.Env):
     def __init__(self, 
@@ -64,13 +65,15 @@ class CFNEnv(gym.Env):
         for i, task in enumerate(raw_tasks):
             task.source_node = i 
             
-        # PSTDQN: Sort by Priority (h_i) descending
-        # Eq (12) h_i = A / D. Priority is high if h_i is high?
-        # Paper says "tasks with high priority are given priority".
-        # Assume Descending sort.
-        self.current_tasks_buffer = sorted(raw_tasks, key=lambda t: t.priority, reverse=True)
+        # PSTDQN Algorithm I: Sort by Priority
+        self.current_tasks_buffer = priority_sort(raw_tasks)
+        
         self.current_task_idx = 0
         self.current_task = self.current_tasks_buffer[0]
+        
+        # Clear server capacities for new slot (Assuming slot-based clearing)
+        for s in self.servers:
+            s.clear()
 
     def _get_obs(self):
         # Task Features
@@ -101,53 +104,48 @@ class CFNEnv(gym.Env):
         target_server_node = self.es_node_indices[target_server_idx]
         task = self.current_task
         
-        # Calculate Delays
-        # 1. Transmission Delay (Source -> ES)
-        # Assuming direct transmission or via network?
-        # Paper Eq (2) t^t = A / R. (Access Delay)
-        # Assuming Source is connected to SOME Access Point.
-        # Simplification: Source transmits DIRECTLY to Target ES via Wireless Channel Eq(1).
-        # OR: Source -> Local BS -> Backhaul -> Target ES.
+        # Check Resource Constraints (Algorithm II Effect)
+        # Eq (15a): sum(C_{i,e}) <= C_e
+        # PSTDQN uses Greedy Allocation (First Come First Served by Priority).
+        # We check if assignment is VALID.
         
-        # Using Network Model:
-        # We calculate rate between Source and Target.
-        tx_power = 0.5 # Watts (27dBm)
-        rate = self.network.get_transmission_rate(task.source_node, target_server_node, self.channel, tx_power)
-        t_tx = self.network.get_transmission_delay(task.data_volume, rate)
+        accepted = target_server.can_accommodate(task, self.slot_duration)
         
-        # 2. Queue Delay
-        t_q = target_server.get_queue_delay()
-        
-        # 3. Computing Delay
-        t_c = target_server.get_computing_delay(task)
-        
-        # 4. Migration Delay
-        # If the task was "originally" at a "directly connected ES" and moved?
-        # Paper "Transmission model": "data transmission rate of device n to a directly connected node".
-        # This implies tasks go Device -> Local ES first?
-        # "Task i migrates from node e_begin to e_end".
-        # Let's simplify:
-        # The Action DECIDES where the task is processed.
-        # If Target != Local_Connected_ES, add Migration Delay.
-        # For simulation, let's assume TE i is connected to ES (i % num_ess).
-        local_es_idx = task.source_node % self.num_ess
-        local_es_node = self.es_node_indices[local_es_idx]
-        
-        if local_es_idx != target_server_idx:
-            t_mig = self.network.get_migration_delay(local_es_node, target_server_node, task.data_volume)
+        if not accepted:
+            # Penalty for dropping task / failing constraint
+            # Large delay
+            total_delay = 100.0 
+            reward = -1000.0 * task.priority # Heavy penalty
         else:
-            t_mig = 0.0
+            # Calculate Delays
+            # 1. Transmission Delay (Source -> ES)
+            tx_power = 0.5 # Watts (27dBm)
+            rate = self.network.get_transmission_rate(task.source_node, target_server_node, self.channel, tx_power)
+            t_tx = self.network.get_transmission_delay(task.data_volume, rate)
             
-        total_delay = t_tx + t_q + t_c + t_mig
-        
-        # Update Server State
-        target_server.add_task(task)
-        
-        # Calculate Reward (Eq 11 Cost)
-        # Cost = Sum(Total Delay * Priority) / Sum(Priority)
-        # Since we punish step-by-step, Reward = -1 * (Delay * Priority)
-        # Normalizing might be good for DQN stability.
-        reward = -1.0 * total_delay * task.priority
+            # 2. Queue Delay
+            t_q = target_server.get_queue_delay()
+            
+            # 3. Computing Delay
+            t_c = target_server.get_computing_delay(task)
+            
+            # 4. Migration Delay
+            local_es_idx = task.source_node % self.num_ess
+            local_es_node = self.es_node_indices[local_es_idx]
+            
+            if local_es_idx != target_server_idx:
+                t_mig = self.network.get_migration_delay(local_es_node, target_server_node, task.data_volume)
+            else:
+                t_mig = 0.0
+                
+            total_delay = t_tx + t_q + t_c + t_mig
+            
+            # Update Server State
+            target_server.add_task(task)
+            
+            # Calculate Reward (Eq 11 Cost)
+            # Reward = -1 * (Delay * Priority)
+            reward = -1.0 * total_delay * task.priority
         
         # Move to next task
         self.current_task_idx += 1
@@ -156,7 +154,7 @@ class CFNEnv(gym.Env):
         
         if self.current_task_idx >= len(self.current_tasks_buffer):
             # End of Time Slot
-            # Process Server Queues
+            # Process Server Work (Simulate execution)
             for s in self.servers:
                 s.process(self.slot_duration)
                 
@@ -168,5 +166,5 @@ class CFNEnv(gym.Env):
         else:
             self.current_task = self.current_tasks_buffer[self.current_task_idx]
             
-        return self._get_obs(), reward, terminated, truncated, {"delay": total_delay}
+        return self._get_obs(), reward, terminated, truncated, {"delay": total_delay, "accepted": accepted}
 
